@@ -164,6 +164,9 @@ ngx_event_accept(ngx_event_t *ev)
             return;
         }
 
+        ngx_pool_extra(c->pool)->owner.type = NGX_POOL_OWNER_CONNECTION;
+        ngx_pool_extra(c->pool)->owner.p = c;
+
         c->sockaddr = ngx_palloc(c->pool, socklen);
         if (c->sockaddr == NULL) {
             ngx_close_accepted_connection(c);
@@ -449,6 +452,9 @@ ngx_event_recvmsg(ngx_event_t *ev)
             ngx_close_accepted_connection(c);
             return;
         }
+
+        ngx_pool_extra(c->pool)->owner.type = NGX_POOL_OWNER_CONNECTION;
+        ngx_pool_extra(c->pool)->owner.p = c;
 
         c->sockaddr = ngx_palloc(c->pool, c->socklen);
         if (c->sockaddr == NULL) {

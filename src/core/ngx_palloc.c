@@ -8,17 +8,154 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
+#include <execinfo.h>
+#include <stdio.h>
+#include <unistd.h>
 
 static ngx_inline void *ngx_palloc_small(ngx_pool_t *pool, size_t size,
     ngx_uint_t align);
 static void *ngx_palloc_block(ngx_pool_t *pool, size_t size);
 static void *ngx_palloc_large(ngx_pool_t *pool, size_t size);
+static void insert_pool(ngx_pool_t* pool);
+static void remove_pool(ngx_pool_t* pool);
+static void memory_status_printer(int sig);
+static void init_signal_handler(int sig);
 
+ngx_pool_list_t* all_pools = NULL;
+size_t all_pools_count = 0;
+size_t all_pools_size = 0;
+
+FILE* ngx_mem_dbg = 0;
+
+typedef void (*signal_handler_t)(int);
+signal_handler_t original_handler = 0;
+int signal_initialized = 0;
+int current_pid = 0;
+
+void insert_pool(ngx_pool_t* pool) {
+  ngx_pool_list_t* new;
+
+  new = (ngx_pool_list_t*)malloc(sizeof(ngx_pool_list_t));
+  new->pool = pool;
+  new->prev = NULL;
+  new->next = NULL;
+
+  ngx_pool_extra(pool)->list = new;
+
+  if (!all_pools) {
+    all_pools = new;
+  } else {
+    all_pools->prev = new;
+    new->next = all_pools;
+    all_pools = new;
+  }
+  ++all_pools_count;
+}
+
+void remove_pool(ngx_pool_t* pool) {
+  ngx_pool_list_t* list;
+
+  list = ngx_pool_extra(pool)->list;
+  if (list == all_pools) {
+    if (list->next) {
+      all_pools = list->next;
+    } else {
+      all_pools = NULL;
+    }
+  }
+
+  if (list->prev) {
+    list->prev->next = list->next;
+  }
+  if (list->next) {
+    list->next->prev = list->prev;
+  }
+
+  free(list);
+  --all_pools_count;
+}
+
+void ngx_init_mem_debug(void) {
+  if (current_pid != 0 && current_pid != getpid()) {
+    // forked from master
+    current_pid = 0;
+    ngx_mem_dbg = 0;
+    signal_initialized = 0;
+  }
+  if (ngx_mem_dbg == 0) {
+    current_pid = getpid();
+    char file_path[256];
+    sprintf(file_path, "/tmp/mem.%d.log", current_pid);
+    ngx_mem_dbg = fopen(file_path, "w");
+  }
+  init_signal_handler(SIGINT);
+}
+
+static ngx_inline const char* pool_owner_type(int owner_type) {
+  if (owner_type == NGX_POOL_OWNER_CONNECTION) {
+    return "ngx_connection_t";
+  } else if (owner_type == NGX_POOL_OWNER_REQUEST) {
+    return "ngx_http_request_t";
+  } else {
+    return "void";
+  }
+}
+
+static void memory_status_printer(int sig) {
+  ngx_pool_list_t* list;
+  ngx_pool_extra_t* extra;
+  MEM_DEBUG("************** NGINX MEMORY STATUS **************\n");
+  list = all_pools;
+  while (list) {
+    extra = ngx_pool_extra(list->pool);
+    MEM_DEBUG("* %p -> %zu\n* owner ---> (%s*)(%p)\n* alloc backtrace --->\n",
+              list->pool,
+              extra->size,
+              pool_owner_type(extra->owner.type),
+              extra->owner.p);
+    fflush(ngx_mem_dbg); // flush as backtrace_symbols_fd uses the fd directly
+    backtrace_symbols_fd(extra->bt.trace, extra->bt.size, fileno(ngx_mem_dbg));
+    MEM_DEBUG("------------------------------------------------\n");
+    list = list->next;
+  }
+
+  MEM_DEBUG("**************     POOL SUMMARY    **************\n");
+  list = all_pools;
+  while (list) {
+    extra = ngx_pool_extra(list->pool);
+    MEM_DEBUG("* %p -> %zu\n", list->pool, extra->size);
+    list = list->next;
+  }
+  MEM_DEBUG("* overall pools alive      -> %zu\n", all_pools_count);
+  MEM_DEBUG("* overall memory allocated -> %zu\n", all_pools_size);
+  MEM_DEBUG("****************************************\n");
+  fflush(ngx_mem_dbg);
+  init_signal_handler(sig);
+}
+
+static void init_signal_handler(int sig) {
+  signal_handler_t ret;
+  ret = signal(sig, memory_status_printer);
+  if (!signal_initialized) {
+    if (ret == SIG_ERR) {
+      MEM_DEBUG("************* FAILED TO INITIALIZE THE SIGNAL %d for %d ******************\n", sig, getpid());
+    } else {
+      signal_initialized = 1;
+      MEM_DEBUG("Signal %d initialized for %d\n", sig, getpid());
+      original_handler = ret;
+    }
+  }
+}
+
+ngx_inline ngx_pool_extra_t* ngx_pool_extra(ngx_pool_t* p) {
+  return (ngx_pool_extra_t*)(p->extra);
+}
 
 ngx_pool_t *
 ngx_create_pool(size_t size, ngx_log_t *log)
 {
     ngx_pool_t  *p;
+    ngx_pool_extra_t *extra;
 
     p = ngx_memalign(NGX_POOL_ALIGNMENT, size, log);
     if (p == NULL) {
@@ -39,6 +176,15 @@ ngx_create_pool(size_t size, ngx_log_t *log)
     p->cleanup = NULL;
     p->log = log;
 
+    p->extra = malloc(sizeof(ngx_pool_extra_t));
+    extra = ngx_pool_extra(p);
+    memset(extra, 0, sizeof(ngx_pool_extra_t));
+    extra->bt.size = backtrace(extra->bt.trace, sizeof(extra->bt.trace)/sizeof(*extra->bt.trace));
+
+    insert_pool(p);
+
+    MEM_DEBUG("ngx_create_pool: %zu -> %p -- overall %zu\n", size, p, all_pools_count);
+
     return p;
 }
 
@@ -49,6 +195,13 @@ ngx_destroy_pool(ngx_pool_t *pool)
     ngx_pool_t          *p, *n;
     ngx_pool_large_t    *l;
     ngx_pool_cleanup_t  *c;
+
+    all_pools_size -= ngx_pool_extra(pool)->size;
+    remove_pool(pool);
+    free(pool->extra);
+
+    MEM_DEBUG("ngx_destroy_pool: %p -- overall %zu\n", pool, all_pools_count);
+    MEM_DEBUG("overall memory allocated %zu\n", all_pools_size);
 
     for (c = pool->cleanup; c; c = c->next) {
         if (c->handler) {
@@ -113,6 +266,8 @@ ngx_reset_pool(ngx_pool_t *pool)
         p->d.failed = 0;
     }
 
+    MEM_DEBUG("ngx_reset_pool: %p\n", p);
+
     pool->current = pool;
     pool->chain = NULL;
     pool->large = NULL;
@@ -122,26 +277,67 @@ ngx_reset_pool(ngx_pool_t *pool)
 void *
 ngx_palloc(ngx_pool_t *pool, size_t size)
 {
+    MEM_DEBUG("ngx_palloc: %zu from %p\n", size, pool);
+    void* p;
+    size_t alloc_size;
+
+    ngx_pool_extra(pool)->size += size;
+    all_pools_size += size;
+
+    MEM_DEBUG("pool size %zu, overall memory allocated %zu\n", ngx_pool_extra(pool)->size, all_pools_size);
+
+    alloc_size = size + sizeof(size_t);
+
 #if !(NGX_DEBUG_PALLOC)
-    if (size <= pool->max) {
-        return ngx_palloc_small(pool, size, 1);
+    if (alloc_size <= pool->max) {
+        p = ngx_palloc_small(pool, alloc_size, 1);
+        *(size_t*)p = size;
+        p = (size_t*)p + 1;
+
+        MEM_DEBUG("ngx_palloc: %zu from %p -> %p\n", size, pool, p);
+        return p;
     }
 #endif
 
-    return ngx_palloc_large(pool, size);
+    p = ngx_palloc_large(pool, alloc_size);
+    *(size_t*)p = size;
+    p = (size_t*)p + 1;
+    MEM_DEBUG("ngx_palloc: %zu from %p -> %p\n", size, pool, p);
+    return p;
 }
 
 
 void *
 ngx_pnalloc(ngx_pool_t *pool, size_t size)
 {
+    MEM_DEBUG("ngx_palloc: %zu from %p\n", size, pool);
+    void* p;
+    size_t alloc_size;
+
+    ngx_pool_extra(pool)->size += size;
+    all_pools_size += size;
+
+    MEM_DEBUG("pool size %zu, overall memory allocated %zu\n", ngx_pool_extra(pool)->size, all_pools_size);
+
+    alloc_size = size + sizeof(size_t);
+
 #if !(NGX_DEBUG_PALLOC)
-    if (size <= pool->max) {
-        return ngx_palloc_small(pool, size, 0);
+    if (alloc_size <= pool->max) {
+        p = ngx_palloc_small(pool, alloc_size, 0);
+        *(size_t*)p = size;
+        p = (size_t*)p + 1;
+
+        MEM_DEBUG("ngx_palloc: %zu from %p -> %p\n", size, pool, p);
+        return p;
     }
 #endif
 
-    return ngx_palloc_large(pool, size);
+    p = ngx_palloc_large(pool, alloc_size);
+    *(size_t*)p = size;
+    p = (size_t*)p + 1;
+
+    MEM_DEBUG("ngx_palloc: %zu from %p -> %p\n", size, pool, p);
+    return p;
 }
 
 
@@ -278,6 +474,15 @@ ngx_int_t
 ngx_pfree(ngx_pool_t *pool, void *p)
 {
     ngx_pool_large_t  *l;
+    size_t size;
+
+    p = (size_t*)p - 1;
+    size = *(size_t*)p;
+    ngx_pool_extra(pool)->size -= size;
+    all_pools_size -= size;
+
+    MEM_DEBUG("ngx_pfree %p of size %zu from %p\n", p, size, pool);
+    MEM_DEBUG("pool size %zu, overall memory allocated %zu\n", ngx_pool_extra(pool)->size, all_pools_size);
 
     for (l = pool->large; l; l = l->next) {
         if (p == l->alloc) {

@@ -62,6 +62,7 @@ struct ngx_pool_s {
     ngx_pool_large_t     *large;
     ngx_pool_cleanup_t   *cleanup;
     ngx_log_t            *log;
+    void                 *extra;
 };
 
 
@@ -91,5 +92,44 @@ void ngx_pool_run_cleanup_file(ngx_pool_t *p, ngx_fd_t fd);
 void ngx_pool_cleanup_file(void *data);
 void ngx_pool_delete_file(void *data);
 
+
+
+typedef struct ngx_backtrace_s ngx_backtrace_t;
+typedef struct ngx_pool_owner_s ngx_pool_owner_t;
+typedef struct ngx_pool_extra_s ngx_pool_extra_t;
+typedef struct ngx_pool_list_s ngx_pool_list_t;
+
+extern FILE* ngx_mem_dbg;
+void ngx_init_mem_debug(void);
+ngx_pool_extra_t* ngx_pool_extra(ngx_pool_t* pool);
+
+struct ngx_pool_list_s {
+  ngx_pool_t* pool;
+  ngx_pool_list_t* next;
+  ngx_pool_list_t* prev;
+};
+
+struct ngx_backtrace_s {
+  void* trace[10];
+  int size;
+};
+
+struct ngx_pool_owner_s {
+  void* p;
+  int type;
+};
+
+struct ngx_pool_extra_s {
+  size_t size;
+  ngx_pool_list_t* list;
+  ngx_backtrace_t bt;
+  ngx_pool_owner_t owner;
+};
+
+#define MEM_DEBUG(...) { ngx_init_mem_debug(); fprintf(ngx_mem_dbg, __VA_ARGS__); fflush(ngx_mem_dbg); }
+
+#define NGX_POOL_OWNER_UNKNOWN 0
+#define NGX_POOL_OWNER_REQUEST 1
+#define NGX_POOL_OWNER_CONNECTION 2
 
 #endif /* _NGX_PALLOC_H_INCLUDED_ */

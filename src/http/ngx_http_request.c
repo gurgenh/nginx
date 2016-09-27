@@ -625,6 +625,9 @@ ngx_http_create_request(ngx_connection_t *c)
     (void) ngx_atomic_fetch_add(ngx_stat_requests, 1);
 #endif
 
+    ngx_pool_extra(pool)->owner.type = NGX_POOL_OWNER_REQUEST;
+    ngx_pool_extra(pool)->owner.p = r;
+
     return r;
 }
 
